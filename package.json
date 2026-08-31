@@ -11,7 +11,8 @@
 		"start": "tsx src/index.ts",
 		"smoke": "tsx scripts/smoke.ts",
 		"task": "tsx scripts/task.ts",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "node --import tsx --test \"tests/*.test.ts\""
 	},
 	"dependencies": {
 		"@earendil-works/pi-ai": "^0.84.4",
