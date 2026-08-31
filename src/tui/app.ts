@@ -3,12 +3,14 @@ import {
 	CombinedAutocompleteProvider,
 	Container,
 	Editor,
+	HStack,
 	Loader,
 	Markdown,
 	ProcessTerminal,
 	ScrollView,
 	SelectList,
 	SettingsList,
+	Spacer,
 	Text,
 	TuiAltScreen,
 	VStack,
@@ -24,10 +26,17 @@ import { buildSystemPrompt } from "../agent/prompt.ts";
 import { ToolScheduler } from "../agent/scheduler.ts";
 import { createAskTool } from "../agent/tools/ask.ts";
 import type { ToolRegistry } from "../agent/tools/index.ts";
-import type { AgentEvent, RunMode, ToolCallInfo } from "../events.ts";
+import type { AgentEvent, PermissionDecision, RunMode, ToolCallInfo } from "../events.ts";
 import { createTuiAskUser } from "./ask.ts";
 import { TuiPermissionRequester } from "./permission.ts";
-import { colors, editorTheme, markdownTheme, selectListTheme, settingsListTheme } from "./theme.ts";
+import {
+	colors,
+	dialogOverlayOptions,
+	editorTheme,
+	markdownTheme,
+	selectListTheme,
+	settingsListTheme,
+} from "./theme.ts";
 
 const HELP_MARKDOWN = [
 	"**命令**",
@@ -81,6 +90,7 @@ export class TuiApp {
 	private readonly tui: TuiAltScreen;
 	private readonly transcript = new Container();
 	private readonly header = new Text("", 1, 0);
+	private readonly status = new Text("", 1, 0); // 输入框上方右侧的指标栏（cache 命中率）
 	private readonly scheduler: ToolScheduler;
 	private readonly signalHolder: { signal?: AbortSignal } = {};
 	private events: AgentEvent[] = [];
@@ -109,12 +119,13 @@ export class TuiApp {
 		this.editor = new Editor(this.tui, editorTheme);
 		this.editor.onSubmit = (text) => this.handleSubmit(text);
 
+		// 注意：SlashCommand.name 不带前导斜杠——Editor 的 applyCompletion 会自行补 "/"（否则出现 "//"）
 		const slashCommands: SlashCommand[] = [
-			{ name: "/mode", description: "切换 Default / Full Access 模式" },
-			{ name: "/ask-user", description: "开关 ask_user 工具" },
-			{ name: "/ui", description: "界面设置（思考/工具详情）" },
-			{ name: "/clear", description: "清空当前会话" },
-			{ name: "/help", description: "显示帮助" },
+			{ name: "mode", description: "切换 Default / Full Access 模式" },
+			{ name: "ask-user", description: "开关 ask_user 工具" },
+			{ name: "ui", description: "界面设置（思考/工具详情）" },
+			{ name: "clear", description: "清空当前会话" },
+			{ name: "help", description: "显示帮助" },
 		];
 		this.editor.setAutocompleteProvider(
 			new CombinedAutocompleteProvider(slashCommands, opts.workspace, null),
@@ -162,6 +173,7 @@ export class TuiApp {
 					grow: 1,
 					minSize: 3,
 				},
+				{ component: new HStack([new Spacer(), this.status]), basis: "auto", shrink: 0 },
 				{ component: this.editor, basis: "auto", shrink: 1 },
 			]),
 		);
@@ -194,6 +206,9 @@ export class TuiApp {
 		this.header.setText(
 			`${colors.bold("mini-coding-agent")}${colors.dim(" · ")}${this.opts.workspace}${colors.dim(" · ")}${modeLabel}${colors.dim(" · ")}${askLabel}`,
 		);
+		// 注：cache 公式对 MiniMax usage 字段语义的适配是已知遗留问题，阶段三 commit 后统一修复
+		const cache = this.metrics.turns > 0 ? `cache ${(this.metrics.cacheHitRate * 100).toFixed(0)}%` : "cache --";
+		this.status.setText(colors.dim(cache));
 		this.tui.requestRender();
 	}
 
@@ -261,7 +276,7 @@ export class TuiApp {
 		];
 		const list = new SelectList(items, items.length, selectListTheme);
 		list.setSelectedIndex(this.mode === "default" ? 0 : 1);
-		const handle = this.tui.showOverlay(new VStack([new Text("选择模式", 1, 0), list]));
+		const handle = this.tui.showOverlay(new VStack([new Text("选择模式", 1, 0), list]), dialogOverlayOptions);
 		this.dialogOpen = true;
 		this.tui.setFocus(list);
 		const done = () => {
@@ -289,7 +304,7 @@ export class TuiApp {
 		];
 		const list = new SelectList(items, items.length, selectListTheme);
 		list.setSelectedIndex(this.askUserEnabled ? 0 : 1);
-		const handle = this.tui.showOverlay(new VStack([new Text("ask_user 工具", 1, 0), list]));
+		const handle = this.tui.showOverlay(new VStack([new Text("ask_user 工具", 1, 0), list]), dialogOverlayOptions);
 		this.dialogOpen = true;
 		this.tui.setFocus(list);
 		const done = () => {
@@ -345,7 +360,7 @@ export class TuiApp {
 			},
 			closeDialog,
 		);
-		handle = this.tui.showOverlay(new VStack([new Text("界面设置", 1, 0), list]));
+		handle = this.tui.showOverlay(new VStack([new Text("界面设置", 1, 0), list]), dialogOverlayOptions);
 		this.dialogOpen = true;
 		this.tui.setFocus(list);
 	}
@@ -414,6 +429,25 @@ export class TuiApp {
 			}
 		}
 
+		// 权限记录按 requestId（= callId）归组：跟随对应工具行渲染，而不是独立成行
+		// （否则会在时间线上晚于该工具的 ✓ 行出现，视觉顺序错乱）
+		const permissionByCall = new Map<string, { summary: string; decision?: PermissionDecision }>();
+		for (const e of this.events) {
+			if (e.type === "permission_required") permissionByCall.set(e.requestId, { summary: e.summary });
+			else if (e.type === "permission_resolved") {
+				const rec = permissionByCall.get(e.requestId);
+				if (rec) rec.decision = e.decision;
+			}
+		}
+		const decisionLabel = (d?: PermissionDecision): string =>
+			d === "allow_once"
+				? " → 已允许（一次）"
+				: d === "allow_session"
+					? " → 已允许（本会话）"
+					: d === "deny"
+						? " → 已拒绝"
+						: "";
+
 		for (const e of this.events) {
 			switch (e.type) {
 				case "user_message_added":
@@ -439,6 +473,12 @@ export class TuiApp {
 				case "tool_queued": {
 					const state = tools.get(e.call.callId);
 					const label = toolLabel(e.call);
+					const permission = permissionByCall.get(e.call.callId);
+					if (permission) {
+						this.transcript.addChild(
+							new Text(colors.yellow(`? 权限请求：${permission.summary}${decisionLabel(permission.decision)}`), 1, 0),
+						);
+					}
 					let line: string;
 					if (state?.done) {
 						line = state.done.ok
@@ -461,9 +501,6 @@ export class TuiApp {
 					}
 					break;
 				}
-				case "permission_required":
-					this.transcript.addChild(new Text(colors.yellow(`? 权限请求：${e.summary}`), 1, 0));
-					break;
 				case "user_input_requested":
 					this.transcript.addChild(new Text(colors.cyan(`? Agent 提问：${e.question}`), 1, 0));
 					break;

@@ -1,4 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
+import os from "node:os";
+import path from "node:path";
 import { Type, type Static } from "@earendil-works/pi-ai";
 import type { AgentTool, ToolEnv, ToolExecContext, ToolOutput } from "./index.ts";
 
@@ -39,17 +41,50 @@ function appendCapped(current: string, chunk: string): string {
 	return (current + chunk).slice(0, OUTPUT_CAP);
 }
 
+/**
+ * bash 静态越狱检测（Default 模式，设计方案 §3.1 的 best-effort 边界强化）：
+ * 扫描命令中显式出现的路径（绝对路径 / 盘符 / ~ / .. 逃逸），解析后落在 Workspace
+ * 外即拒绝。注意这只能拦截"命令本身引用了外部路径"——脚本内部再去读外部文件属于
+ * 已知盲区（可靠拦截需要容器级沙箱），已在 README 与系统提示词中声明。
+ */
+export function detectWorkspaceEscape(command: string, workspace: string): string | null {
+	const tokens = command.split(/\s+/).filter(Boolean);
+	for (const raw of tokens) {
+		const t = raw.replace(/^["']+|["']+$/g, "");
+		if (!t || /^[a-z][a-z0-9+.-]*:\/\//i.test(t)) continue; // 跳过 URL
+		const looksPath =
+			/[\\/]/.test(t) || /^[A-Za-z]:/.test(t) || t === ".." || t === "../" || t.startsWith("~");
+		if (!looksPath) continue;
+		const abs = t.startsWith("~") ? path.join(os.homedir(), t.slice(1).replace(/^[/\\]/, "")) : path.resolve(workspace, t);
+		const rel = path.relative(workspace, abs);
+		if (rel !== "" && (rel.startsWith("..") || path.isAbsolute(rel))) return t;
+	}
+	return null;
+}
+
 export function createBashTool(env: ToolEnv): AgentTool {
 	return {
 		name: "bash",
 		kind: "bash",
 		description:
-			"Execute a shell command in the workspace via bash. Concurrency: globally exclusive — while a command runs, no other tool (read/write/list/bash) executes; everything queues. A queued bash first reserves the execution slot, then asks for approval, so once you are approved the command starts immediately; a Deny releases the slot instantly. In Default mode every command needs user approval.",
+			"Execute a shell command in the workspace via bash. Boundary: in Default mode, commands that explicitly reference paths outside the workspace (absolute paths, drive letters, ~, or ../ escapes) are rejected - keep file references relative to the workspace. Concurrency: globally exclusive — while a command runs, no other tool (read/write/list/bash) executes; everything queues. A queued bash first reserves the execution slot, then asks for approval, so once you are approved the command starts immediately; a Deny releases the slot instantly. In Default mode every command needs user approval.",
 		parameters: BashArgs,
 		describe: (a) => `bash: ${String(a.command ?? "").slice(0, 80)}`,
 		async execute(args: Record<string, unknown>, ctx: ToolExecContext): Promise<ToolOutput> {
 			const a = args as unknown as BashArgs;
 			const timeoutMs = a.timeoutMs ?? 120_000;
+
+			// Default 模式：静态越狱检测（显式外部路径引用直接拒绝）
+			if (env.getMode() === "default") {
+				const escape = detectWorkspaceEscape(a.command, env.workspace);
+				if (escape) {
+					return {
+						isError: true,
+						text: `Access denied: the command references a path outside the workspace (${env.workspace}): ${escape}. In Default mode bash must stay inside the workspace; ask the user to switch to Full Access mode (via /mode) if external access is intended.`,
+					};
+				}
+			}
+
 			const useBash = hasBash();
 			const shell = useBash
 				? { file: "bash", args: ["-lc", a.command] }

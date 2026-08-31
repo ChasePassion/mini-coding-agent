@@ -36,6 +36,9 @@ export const settingsListTheme: SettingsListTheme = {
 	hint: colors.dim,
 };
 
+/** 弹窗统一锚定在输入框上方：底部居中 + 负向抬升越过编辑器/状态栏区域 */
+export const dialogOverlayOptions = { anchor: "bottom-center" as const, offsetY: -6 };
+
 export const markdownTheme: MarkdownTheme = {
 	heading: colors.bold,
 	link: colors.cyan,

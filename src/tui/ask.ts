@@ -1,7 +1,7 @@
 import { Editor, SelectList, Text, VStack, type SelectItem, type TUI } from "@earendil-works/pi-tui";
 import type { AgentEvent } from "../events.ts";
 import type { AskUserFn } from "../agent/tools/ask.ts";
-import { editorTheme, selectListTheme } from "./theme.ts";
+import { dialogOverlayOptions, editorTheme, selectListTheme } from "./theme.ts";
 
 /**
  * ask_user 的 TUI 实现（设计方案 §20/§33）：选项列表 + 始终保留的「自定义输入…」。
@@ -32,7 +32,10 @@ export function createTuiAskUser(deps: {
 				{ value: "__custom__", label: "自定义输入…" },
 			];
 			const list = new SelectList(items, Math.min(items.length, 8), selectListTheme);
-			const handle = tui.showOverlay(new VStack([new Text(`Agent 提问：${question}`, 1, 0), list]));
+			const handle = tui.showOverlay(
+				new VStack([new Text(`Agent 提问：${question}`, 1, 0), list]),
+				dialogOverlayOptions,
+			);
 
 			list.onSelect = (item) => {
 				if (item.value !== "__custom__") {
@@ -43,7 +46,10 @@ export function createTuiAskUser(deps: {
 				// 自定义输入：切换为 Editor overlay
 				handle.hide();
 				const editor = new Editor(tui, editorTheme);
-				const editHandle = tui.showOverlay(new VStack([new Text(`你的回答：${question}`, 1, 0), editor]));
+				const editHandle = tui.showOverlay(
+					new VStack([new Text(`你的回答：${question}`, 1, 0), editor]),
+					dialogOverlayOptions,
+				);
 				tui.setFocus(editor);
 				editor.onSubmit = (text) => {
 					editHandle.hide();

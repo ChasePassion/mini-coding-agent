@@ -1,7 +1,7 @@
 import { SelectList, Text, VStack, type SelectItem, type TUI } from "@earendil-works/pi-tui";
 import type { AgentEvent, PermissionDecision, ToolCallInfo } from "../events.ts";
 import type { PermissionRequester } from "../agent/scheduler.ts";
-import { selectListTheme } from "./theme.ts";
+import { dialogOverlayOptions, selectListTheme } from "./theme.ts";
 
 const OPTIONS: SelectItem[] = [
 	{ value: "allow_once", label: "允许一次" },
@@ -34,7 +34,10 @@ export class TuiPermissionRequester implements PermissionRequester {
 						? "Agent 请求写入文件"
 						: `Agent 请求使用工具 ${call.toolName}`;
 			const list = new SelectList([...OPTIONS], OPTIONS.length, selectListTheme);
-			const handle = this.tui.showOverlay(new VStack([new Text(`${verb}：`, 1, 0), new Text(summary, 1, 0), list]));
+			const handle = this.tui.showOverlay(
+				new VStack([new Text(`${verb}：`, 1, 0), new Text(summary, 1, 0), list]),
+				dialogOverlayOptions,
+			);
 
 			const done = (decision: PermissionDecision) => {
 				this.onDialogOpenChange(false);
