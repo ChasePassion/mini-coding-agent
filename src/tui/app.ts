@@ -1,4 +1,3 @@
-import type { Context, Message } from "@earendil-works/pi-ai";
 import {
 	CombinedAutocompleteProvider,
 	Container,
@@ -20,11 +19,7 @@ import {
 	type SlashCommand,
 } from "@earendil-works/pi-tui";
 import type { LLMClient } from "../ai/client.ts";
-import { runAgentLoop } from "../agent/loop.ts";
-import { MetricsCollector } from "../agent/metrics.ts";
-import { buildSystemPrompt } from "../agent/prompt.ts";
-import { ToolScheduler } from "../agent/scheduler.ts";
-import { createAskTool } from "../agent/tools/ask.ts";
+import { AgentSession } from "../agent/session.ts";
 import type { ToolRegistry } from "../agent/tools/index.ts";
 import type { AgentEvent, PermissionDecision, RunMode, ToolCallInfo } from "../events.ts";
 import { createTuiAskUser } from "./ask.ts";
@@ -56,6 +51,12 @@ const HELP_MARKDOWN = [
 
 const WELCOME = "输入任务开始。/help 查看帮助 · Esc 中断 · Ctrl+C 退出";
 
+interface ToolState {
+	call: ToolCallInfo;
+	started: boolean;
+	done?: { ok: boolean; durationMs: number; output?: string; error?: string };
+}
+
 function toolLabel(call: ToolCallInfo): string {
 	switch (call.toolName) {
 		case "read":
@@ -75,15 +76,9 @@ function truncate(text: string, max: number): string {
 	return text.length <= max ? `${text}` : `${text.slice(0, max)}…`;
 }
 
-interface ToolState {
-	call: ToolCallInfo;
-	started: boolean;
-	done?: { ok: boolean; durationMs: number; output?: string; error?: string };
-}
-
 /**
- * 聊天 TUI（设计方案 §23/§24/§26/§27）：事件流的唯一渲染端，不持有业务状态。
- * 渲染 = 从事件日志全量重建 transcript（/ui 折叠切换、未来 WebUI snapshot 共用同一推导逻辑）。
+ * 聊天 TUI（设计方案 §23/§24/§26/§27）：事件流的渲染端。
+ * 编排全部委托 AgentSession（与 WebUI 共享同一核心）；渲染 = 从事件日志全量重建 transcript。
  */
 export class TuiApp {
 	readonly editor: Editor;
@@ -91,18 +86,10 @@ export class TuiApp {
 	private readonly transcript = new Container();
 	private readonly header = new Text("", 1, 0);
 	private readonly status = new Text("", 1, 0); // 输入框上方右侧的指标栏（cache 命中率）
-	private readonly scheduler: ToolScheduler;
-	private readonly signalHolder: { signal?: AbortSignal } = {};
-	private events: AgentEvent[] = [];
-	private metrics = new MetricsCollector();
-	private messages: Message[] = [];
-	private mode: RunMode = "default";
-	private askUserEnabled = true;
+	private readonly session: AgentSession;
 	private expandThinking = false;
 	private expandTools = false;
 	private streaming = false;
-	private running = false;
-	private abortController: AbortController | null = null;
 	private dialogOpen = false;
 	private loader: Loader | null = null;
 
@@ -131,38 +118,33 @@ export class TuiApp {
 			new CombinedAutocompleteProvider(slashCommands, opts.workspace, null),
 		);
 
-		const ask = createTuiAskUser({
-			tui: this.tui,
-			emit: (e) => this.onEvent(e),
-			restoreFocus: () => this.tui.setFocus(this.editor),
-			onDialogOpenChange: (open) => {
-				this.dialogOpen = open;
+		this.session = new AgentSession({
+			client: opts.client,
+			registry: opts.registry,
+			workspace: opts.workspace,
+			sessionId: opts.sessionId,
+			modeRef: opts.modeRef,
+			hooks: {
+				requestPermission: (call: ToolCallInfo, summary: string) =>
+					new TuiPermissionRequester(
+						this.tui,
+						(e) => this.session.emit(e),
+						() => this.tui.setFocus(this.editor),
+						(open) => {
+							this.dialogOpen = open;
+						},
+					).request(call, summary),
+				askUser: createTuiAskUser({
+					tui: this.tui,
+					emit: (e) => this.session.emit(e),
+					restoreFocus: () => this.tui.setFocus(this.editor),
+					onDialogOpenChange: (open) => {
+						this.dialogOpen = open;
+					},
+				}),
+				onEvent: (e) => this.onEvent(e),
 			},
 		});
-		opts.registry.register(createAskTool(ask));
-
-		// ctx.signal 走 getter 桥接 signalHolder：每轮任务的 AbortController 动态挂载，工具可感知中断
-		// （getter 内 this 指向 ctx 对象，故先捕获 holder 引用）
-		const signalHolder = this.signalHolder;
-		this.scheduler = new ToolScheduler(
-			opts.registry,
-			new TuiPermissionRequester(
-				this.tui,
-				(e) => this.onEvent(e),
-				() => this.tui.setFocus(this.editor),
-				(open) => {
-					this.dialogOpen = open;
-				},
-			),
-			(e) => this.onEvent(e),
-			{
-				workspace: opts.workspace,
-				getMode: () => this.mode,
-				get signal() {
-					return signalHolder.signal;
-				},
-			},
-		);
 
 		this.tui.setLayoutRoot(
 			new VStack([
@@ -183,17 +165,17 @@ export class TuiApp {
 				this.tui.stop();
 				process.exit(0);
 			}
-			if (matchesKey(data, "escape") && this.running && !this.dialogOpen) this.interrupt();
+			if (matchesKey(data, "escape") && this.session.running && !this.dialogOpen) this.interrupt();
 			return undefined;
 		});
 	}
 
 	start(): void {
-		this.onEvent({
+		this.session.emit({
 			type: "session_started",
 			sessionId: this.opts.sessionId,
 			workspace: this.opts.workspace,
-			mode: this.mode,
+			mode: this.session.modeRef.mode,
 		});
 		this.tui.setFocus(this.editor);
 		this.tui.start();
@@ -201,19 +183,22 @@ export class TuiApp {
 
 	private refreshHeader(): void {
 		const modeLabel =
-			this.mode === "default" ? colors.green("Default 模式") : colors.yellow("Full Access 模式");
-		const askLabel = this.askUserEnabled ? colors.dim("提问 开") : colors.dim("提问 关");
+			this.session.modeRef.mode === "default"
+				? colors.green("Default 模式")
+				: colors.yellow("Full Access 模式");
+		const askLabel = this.session.askUserEnabled ? colors.dim("提问 开") : colors.dim("提问 关");
 		this.header.setText(
 			`${colors.bold("mini-coding-agent")}${colors.dim(" · ")}${this.opts.workspace}${colors.dim(" · ")}${modeLabel}${colors.dim(" · ")}${askLabel}`,
 		);
 		// 注：cache 公式对 MiniMax usage 字段语义的适配是已知遗留问题，阶段三 commit 后统一修复
-		const cache = this.metrics.turns > 0 ? `cache ${(this.metrics.cacheHitRate * 100).toFixed(0)}%` : "cache --";
+		const cache =
+			this.session.metrics.turns > 0 ? `cache ${(this.session.metrics.cacheHitRate * 100).toFixed(0)}%` : "cache --";
 		this.status.setText(colors.dim(cache));
 		this.tui.requestRender();
 	}
 
 	private interrupt(): void {
-		this.abortController?.abort();
+		this.session.interrupt();
 		this.transcript.addChild(new Text(colors.yellow("· 已请求中断，等待收尾…"), 1, 0));
 		this.tui.requestRender();
 	}
@@ -221,7 +206,7 @@ export class TuiApp {
 	private handleSubmit(raw: string): void {
 		const text = raw.trim();
 		if (!text) return;
-		if (this.running) {
+		if (this.session.running) {
 			this.transcript.addChild(new Text(colors.red("任务进行中，请先按 Esc 中断再输入"), 1, 0));
 			this.tui.requestRender();
 			return;
@@ -230,7 +215,7 @@ export class TuiApp {
 			this.handleCommand(text);
 			return;
 		}
-		void this.runTurn(text);
+		void this.session.runTurn(text);
 	}
 
 	private handleCommand(text: string): void {
@@ -245,11 +230,10 @@ export class TuiApp {
 				this.showUiDialog();
 				return;
 			case "/clear":
-				this.messages = [];
-				this.events = [];
-				this.metrics = new MetricsCollector();
+				this.session.reset();
 				this.transcript.clear();
 				this.transcript.addChild(new Text(colors.dim("会话已清空"), 1, 0));
+				this.refreshHeader();
 				this.tui.requestRender();
 				return;
 			case "/help":
@@ -265,7 +249,7 @@ export class TuiApp {
 	}
 
 	private showModeDialog(): void {
-		if (this.running) {
+		if (this.session.running) {
 			this.transcript.addChild(new Text(colors.yellow("任务进行中无法切换模式，请先按 Esc 中断"), 1, 0));
 			this.tui.requestRender();
 			return;
@@ -275,7 +259,7 @@ export class TuiApp {
 			{ value: "full_access", label: "Full Access 模式（解除边界与审批）" },
 		];
 		const list = new SelectList(items, items.length, selectListTheme);
-		list.setSelectedIndex(this.mode === "default" ? 0 : 1);
+		list.setSelectedIndex(this.session.modeRef.mode === "default" ? 0 : 1);
 		const handle = this.tui.showOverlay(new VStack([new Text("选择模式", 1, 0), list]), dialogOverlayOptions);
 		this.dialogOpen = true;
 		this.tui.setFocus(list);
@@ -288,11 +272,7 @@ export class TuiApp {
 		list.onSelect = (item) => {
 			const next = item.value as RunMode;
 			done();
-			if (next !== this.mode) {
-				this.mode = next;
-				this.opts.modeRef.mode = next;
-				this.onEvent({ type: "mode_changed", mode: next });
-			}
+			this.session.setMode(next);
 		};
 		list.onCancel = done;
 	}
@@ -303,7 +283,7 @@ export class TuiApp {
 			{ value: "off", label: "关闭（从模型可见工具中移除）" },
 		];
 		const list = new SelectList(items, items.length, selectListTheme);
-		list.setSelectedIndex(this.askUserEnabled ? 0 : 1);
+		list.setSelectedIndex(this.session.askUserEnabled ? 0 : 1);
 		const handle = this.tui.showOverlay(new VStack([new Text("ask_user 工具", 1, 0), list]), dialogOverlayOptions);
 		this.dialogOpen = true;
 		this.tui.setFocus(list);
@@ -316,10 +296,7 @@ export class TuiApp {
 		list.onSelect = (item) => {
 			const next = item.value === "on";
 			done();
-			if (next !== this.askUserEnabled) {
-				this.askUserEnabled = next;
-				this.onEvent({ type: "ask_user_toggled", enabled: next });
-			}
+			this.session.toggleAskUser(next);
 		};
 		list.onCancel = done;
 	}
@@ -365,61 +342,28 @@ export class TuiApp {
 		this.tui.setFocus(list);
 	}
 
-	private async runTurn(text: string): Promise<void> {
-		this.running = true;
-		this.abortController = new AbortController();
-		this.signalHolder.signal = this.abortController.signal;
-
-		this.messages.push({ role: "user", content: text, timestamp: Date.now() });
-		this.onEvent({
-			type: "user_message_added",
-			messageId: `user-${Date.now().toString(36)}`,
-			content: text,
-			timestamp: Date.now(),
-		});
-
-		const context: Context = {
-			systemPrompt: buildSystemPrompt(this.opts.workspace, this.mode),
-			messages: this.messages,
-			tools: this.opts.registry.list({ askUser: this.askUserEnabled }),
-		};
-		try {
-			await runAgentLoop(context, {
-				client: this.opts.client,
-				scheduler: this.scheduler,
-				emit: (e) => this.onEvent(e),
-				signal: this.abortController.signal,
-			});
-		} finally {
-			this.running = false;
-			this.abortController = null;
-			this.signalHolder.signal = undefined;
-		}
-	}
-
 	private onEvent(e: AgentEvent): void {
-		this.events.push(e);
-		this.metrics.onEvent(e);
 		if (e.type === "assistant_started") this.streaming = true;
 		if (e.type === "assistant_completed" || e.type === "turn_completed") this.streaming = false;
 		this.rebuildTranscript();
 		this.refreshHeader();
 	}
 
-	/** 渲染 = fold(事件日志)：唯一构建 UI 状态的方式，与折叠开关、未来 WebUI snapshot 共用 */
+	/** 渲染 = fold(事件日志)：唯一构建 UI 状态的方式，与折叠开关、WebUI snapshot 共用 */
 	private rebuildTranscript(): void {
 		if (this.loader) {
 			this.loader.stop();
 			this.loader = null;
 		}
 		this.transcript.clear();
+		const events = this.session.events;
 
 		// 工具调用终态预计算（按事件顺序推导）
 		const tools = new Map<string, ToolState>();
-		for (const e of this.events) {
+		for (const e of events) {
 			if (e.type === "tool_queued") tools.set(e.call.callId, { call: e.call, started: false });
 		}
-		for (const e of this.events) {
+		for (const e of events) {
 			if (e.type === "tool_started") {
 				const t = tools.get(e.callId);
 				if (t) t.started = true;
@@ -432,7 +376,7 @@ export class TuiApp {
 		// 权限记录按 requestId（= callId）归组：跟随对应工具行渲染，而不是独立成行
 		// （否则会在时间线上晚于该工具的 ✓ 行出现，视觉顺序错乱）
 		const permissionByCall = new Map<string, { summary: string; decision?: PermissionDecision }>();
-		for (const e of this.events) {
+		for (const e of events) {
 			if (e.type === "permission_required") permissionByCall.set(e.requestId, { summary: e.summary });
 			else if (e.type === "permission_resolved") {
 				const rec = permissionByCall.get(e.requestId);
@@ -448,7 +392,7 @@ export class TuiApp {
 						? " → 已拒绝"
 						: "";
 
-		for (const e of this.events) {
+		for (const e of events) {
 			switch (e.type) {
 				case "user_message_added":
 					this.transcript.addChild(new Text(`${colors.bold("❯ ")}${e.content}`, 1, 0));
@@ -511,7 +455,7 @@ export class TuiApp {
 					this.transcript.addChild(new Text(colors.red(`✗ ${e.message}`), 1, 0));
 					break;
 				case "turn_completed": {
-					const m = this.metrics;
+					const m = this.session.metrics;
 					const parts: string[] = [];
 					if (m.turns > 0) parts.push(`cache ${(m.cacheHitRate * 100).toFixed(0)}%`);
 					const total = m.tools.ok + m.tools.failed;
@@ -527,7 +471,7 @@ export class TuiApp {
 			}
 		}
 
-		if (!this.events.some((e) => e.type === "user_message_added")) {
+		if (!events.some((e) => e.type === "user_message_added")) {
 			this.transcript.addChild(new Text(colors.dim(WELCOME), 1, 0));
 		}
 		if (this.streaming) {

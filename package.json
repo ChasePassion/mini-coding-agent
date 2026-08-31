@@ -16,7 +16,9 @@
 	},
 	"dependencies": {
 		"@earendil-works/pi-ai": "^0.84.4",
-		"@earendil-works/pi-tui": "^0.84.4"
+		"@earendil-works/pi-tui": "^0.84.4",
+		"@types/ws": "^8.18.1",
+		"ws": "^8.21.3"
 	},
 	"devDependencies": {
 		"@types/node": "^24.0.0",

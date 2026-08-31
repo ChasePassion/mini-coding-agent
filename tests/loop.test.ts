@@ -10,18 +10,24 @@ import { deferred, fakeTool, harness, waitFor } from "./helpers.ts";
 
 let seq = 0;
 
+function mkUsage(u: { input: number; output: number; cacheRead: number; cacheWrite: number }): Usage {
+	return {
+		...u,
+		totalTokens: u.input + u.output + u.cacheRead + u.cacheWrite,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
 function mkAssistant(opts: {
 	text?: string;
 	thinking?: string;
 	toolCalls?: { name: string; args: Record<string, unknown> }[];
 	stopReason: StopReason;
 	errorMessage?: string;
-	usage?: Usage;
+	usage?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 }): AssistantMessage {
 	const content: AssistantMessage["content"] = [];
-	if (opts.thinking) {
-		content.push({ type: "thinking", text: opts.thinking } as AssistantMessage["content"][number]);
-	}
+	if (opts.thinking) content.push({ type: "thinking", thinking: opts.thinking });
 	if (opts.text) content.push({ type: "text", text: opts.text });
 	for (const tc of opts.toolCalls ?? []) {
 		seq += 1;
@@ -33,9 +39,10 @@ function mkAssistant(opts: {
 		api: "anthropic-messages",
 		provider: "minimax-cn",
 		model: "test-model",
-		usage: opts.usage ?? { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+		usage: mkUsage(opts.usage ?? { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }),
 		stopReason: opts.stopReason,
 		errorMessage: opts.errorMessage,
+		timestamp: Date.now(),
 	};
 }
 
@@ -48,7 +55,7 @@ function fakeClient(script: AssistantMessage[]): LLMClient {
 			if (!msg) throw new Error("test script exhausted");
 			async function* iterate() {
 				for (const block of msg.content) {
-					if (block.type === "thinking") yield { type: "thinking_delta", delta: (block as { text: string }).text };
+					if (block.type === "thinking") yield { type: "thinking_delta", delta: block.thinking };
 					else if (block.type === "text") yield { type: "text_delta", delta: block.text };
 				}
 			}
