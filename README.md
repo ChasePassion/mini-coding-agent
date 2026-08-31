@@ -1,8 +1,8 @@
 # mini-coding-agent
 
-一个最小可用的 Coding Agent：自写 Agent Loop + 四个基础工具（read / write / list / bash）+ 权限控制 + TUI。
+一个最小可用的 Coding Agent：自写 Agent Loop + 四个基础工具（read / write / list / bash）+ ask_user + 并发调度（两级锁 + Bash 预约）+ 权限控制 + TUI。
 
-> 面试项目 Phase 1 基线。产品规格见 [`设计方案.md`](./设计方案.md)，技术设计见 [`技术方案.md`](./技术方案.md)。
+> 面试项目。产品规格见 [`设计方案.md`](./设计方案.md)，技术设计见 [`技术方案.md`](./技术方案.md)。Phase 1 = 基础 Agent + TUI；Phase 2 = 并发调度 + 权限深化 + ask_user + 指标与界面增强。
 
 ## 快速开始
 
@@ -40,16 +40,20 @@ npm start              # 在目标项目目录启动 TUI，当前目录即 Works
 - **Agent Loop**：`stopReason === "toolUse"` 就继续，否则退出；对权限、并发、锁零感知，全部下沉给 Scheduler。
 - **事件模型**：`AgentEvent` 判别联合（会话 / 回合 / 工具调度态与执行态分离 / ask_user / 异常），前端不持有业务状态，一切由事件推导。
 
-## 工具与并发语义
+## 工具与并发语义（Phase 2 已由 Scheduler 实现）
 
-| 工具 | 权限（Default 模式） | 并发语义（Phase 2 由 Scheduler 实现） |
+| 工具 | 权限（Default 模式） | 并发语义 |
 | --- | --- | --- |
 | `read` | 免批准 | 同文件读并行；分页读取（offset/limit，~10k token 截断 + 续读提示） |
-| `write` | 需批准（允许一次 / 本次会话均允许 / 拒绝） | 同文件独占，异文件并行 |
+| `write` | 需批准（允许一次 / 本次会话均允许 / 拒绝） | 同文件独占（FIFO，写防饥饿），异文件并行；先批准后加锁 |
 | `list` | 免批准 | 与读并行 |
-| `bash` | 需批准（同上） | 全局独占：执行期间一切工具排队 |
+| `bash` | 需批准（同上） | 全局独占：执行期间一切工具排队；先预约执行权再弹权限窗，Deny 立即归还 |
+| `ask_user` | 免批准 | 挂起等用户回答期间其他工具照常执行 |
 
-工具 description 面向模型写明上述语义（见 `src/agent/tools/`），模型据此正确发起并行调用；`validateToolArguments`（TypeBox）把模型幻觉参数变成干净的错误结果而不是异常。
+- **两级锁**：全局门（bash 独占 / 其余共享）+ 文件读写锁（read 共享 / write 独占），等待队列严格 FIFO。
+- **Bash 预约**（设计方案 §10/§11）：bash 先等所有在途工具结束 → 预约执行权（挡住新工具）→ 请求权限 → 批准后立即独占执行；拒绝立即归还执行资格。用户批准后不会出现"还要排队"的体验。
+- **冲突等待而非报错**：并发冲突由 Scheduler 自动排队，模型永远收不到 "File Locked" 类错误。
+- 工具 description 面向模型写明上述语义（见 `src/agent/tools/`），模型据此正确发起并行调用；`validateToolArguments`（TypeBox）把模型幻觉参数变成干净的错误结果而不是异常。
 
 ## 模式与安全
 
@@ -60,8 +64,9 @@ npm start              # 在目标项目目录启动 TUI，当前目录即 Works
 
 ```bash
 npm run typecheck                 # tsc --noEmit
+npm test                          # §9.1 离线测试矩阵（node:test，零网络）：并发 C1-C21、指标、read 分页、loop、abort、参数校验
 npm run smoke                     # 连通 Key 的一次流式调用
-npm run task -- "总结 设计方案.md"          # headless 跑单个任务（事件流打印到终端）
+npm run task -- "总结 设计方案.md"          # headless 跑单个任务（事件流带时间戳打印）
 npm run task -- "写一个脚本并运行" --auto   # --auto 自动批准权限请求（缺省一律拒绝）
 ```
 
@@ -73,15 +78,28 @@ Phase 1 验收三案例（设计方案 §37）均已通过：
 
 另验证了 Workspace 边界：越界路径（如 `E:/demo/../../Windows/win.ini`）被硬边界拒绝。
 
+Phase 2 专项验证：
+
+- **并行工具调用**：两个 read 同毫秒 `tool_started`，真并发非串行（headless 时间戳可见）
+- **ask_user**：模型两次挂起提问 → 回答作为 Tool Result 回填 → loop 继续 → 写文件
+- **37 个离线单测**覆盖并发矩阵全部场景（含 Bash 预约竞态 C11-C13、FIFO 批量放行、写防饥饿、锁键归一化、异常/中断不漏锁）
+
+## 界面
+
+- **TUI**（`npm start`）：头部（Workspace / 模式 / ask_user 开关）+ 对话流（工具行 `排队 → ◌ → ✓/×`，等待队列可见）+ 输入框
+- Slash 命令（带自动补全）：`/mode` 切换模式、`/ask-user` 开关 ask_user（OFF 时从模型可见 schema 中移除，而非返回拒绝）、`/ui` 展开思考过程/工具详情（全量重绘）、`/clear`、`/help`
+- 每轮结束打印指标摘要行：`— cache 62% · tools 5/6 · deny 1 —`（缓存命中率 = cacheRead / (input+cacheRead+cacheWrite)；deny 不计入失败分母）
+- `Esc` 中断当前任务（AbortSignal 贯穿到 bash 子进程），`Ctrl+C` 退出
+
 ## 录屏说明
 
 开发过程录屏文件后续存放于 `recordings/` 目录（不包含 Key 等敏感信息）。
 
-## Roadmap（Phase 2）
+## Roadmap（Phase 3）
 
-- [ ] 工具并行调用：Scheduler 换并发版（两级锁：全局门 + 文件读写锁，Bash 预约执行权）
-- [ ] `ask_user` 工具与开关（动态增删 tool schema）
-- [ ] WebUI（WebSocket 消费同一事件流）
-- [ ] 等待队列展示与 slash 命令补全
+- [x] ~~工具并行调用：两级锁（全局门 + 文件读写锁）+ Bash 预约执行权~~（Phase 2 完成）
+- [x] ~~`ask_user` 工具与开关~~（Phase 2 完成）
+- [x] ~~指标采集（缓存命中率 / 工具成功率）与 `/ui` 折叠开关、slash 补全、等待队列展示~~（Phase 2 完成）
+- [ ] WebUI（WebSocket 消费同一事件流，快照恢复，权限/ask_user 卡片）
 
-详细设计见技术方案 §8 阶段二。
+详细设计见技术方案 §8 阶段三。
