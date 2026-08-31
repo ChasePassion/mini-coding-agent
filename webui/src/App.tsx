@@ -1,6 +1,12 @@
 // WebUI 主应用：左侧会话栏 + 右侧对话区（设计方案 §28-§33）。
 // 全部状态由下行事件流推导（snapshot 重建 + 增量事件），前端不持有业务状态。
-import { PromptInput, PromptInputBody, PromptInputSubmit, PromptInputTextarea } from "@/components/ai-elements/prompt-input";
+import {
+	PromptInput,
+	PromptInputBody,
+	PromptInputFooter,
+	PromptInputSubmit,
+	PromptInputTextarea,
+} from "@/components/ai-elements/prompt-input";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -121,7 +127,7 @@ export default function App() {
 	);
 
 	return (
-		<div className="bg-background text-foreground flex h-screen">
+		<div className="bg-background text-foreground flex h-dvh min-h-0 overflow-hidden">
 			<aside className="bg-muted/30 border-border flex w-60 shrink-0 flex-col border-r">
 				<div className="border-border flex items-center justify-between border-b px-4 py-3">
 					<span className="text-sm font-semibold">mini-coding-agent</span>
@@ -154,8 +160,8 @@ export default function App() {
 				<div className="border-border text-muted-foreground border-t px-4 py-2 text-xs">Workspace：本地工作目录</div>
 			</aside>
 
-			<main className="flex min-w-0 flex-1 flex-col">
-				<header className="border-border flex h-12 items-center gap-2 border-b px-4">
+			<main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+				<header className="border-border flex h-12 shrink-0 items-center gap-2 border-b px-4">
 					<Button
 						size="sm"
 						variant={state.mode === "default" ? "default" : "outline"}
@@ -186,11 +192,11 @@ export default function App() {
 					</div>
 				</header>
 
-				<div className="min-h-0 flex-1">
+				<div className="min-h-0 min-w-0 flex-1 overflow-hidden">
 					<Timeline items={items} streaming={streaming} actions={actions} />
 				</div>
 
-				<div className="border-border border-t p-3">
+				<div className="border-border bg-background shrink-0 border-t px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-2 sm:px-4 sm:pb-4">
 					<PromptInput
 						className="mx-auto max-w-3xl"
 						onSubmit={(message) => {
@@ -199,9 +205,19 @@ export default function App() {
 						}}
 					>
 						<PromptInputBody>
-							<PromptInputTextarea placeholder={running ? "任务执行中（Esc 不可用，可点右上中断）…" : "输入任务，Enter 发送，Shift+Enter 换行"} />
+							<PromptInputTextarea
+								aria-label="输入任务"
+								className="min-h-16 px-3 py-2.5 text-sm leading-6"
+								placeholder={running ? "任务执行中…" : "描述你想完成的任务…"}
+							/>
 						</PromptInputBody>
-						<PromptInputSubmit status={running ? "streaming" : undefined} onStop={() => send({ type: "interrupt" })} />
+						<PromptInputFooter className="justify-end px-2.5 pb-2 pt-0">
+							<PromptInputSubmit
+								className="rounded-full"
+								status={running ? "streaming" : undefined}
+								onStop={() => send({ type: "interrupt" })}
+							/>
+						</PromptInputFooter>
 					</PromptInput>
 				</div>
 			</main>

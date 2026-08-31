@@ -921,7 +921,9 @@ export const PromptInput = ({
         ref={formRef}
         {...props}
       >
-        <InputGroup className="overflow-hidden">{children}</InputGroup>
+        <InputGroup className="h-auto min-h-0 flex-col items-stretch overflow-hidden rounded-2xl">
+          {children}
+        </InputGroup>
       </form>
     </>
   );
@@ -1249,7 +1251,7 @@ export const PromptInputSubmit = ({
 
   return (
     <InputGroupButton
-      aria-label={isGenerating ? "Stop" : "Submit"}
+      aria-label={isGenerating ? "停止生成" : "发送"}
       className={cn(className)}
       onClick={handleClick}
       size={size}
