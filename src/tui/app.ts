@@ -490,7 +490,9 @@ export class TuiApp {
 			}
 		}
 
-		if (this.events.length === 0) this.transcript.addChild(new Text(colors.dim(WELCOME), 1, 0));
+		if (!this.events.some((e) => e.type === "user_message_added")) {
+			this.transcript.addChild(new Text(colors.dim(WELCOME), 1, 0));
+		}
 		if (this.streaming) {
 			this.loader = new Loader(this.tui, colors.cyan, colors.dim, "生成中…");
 			this.transcript.addChild(this.loader);
