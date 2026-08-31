@@ -1,4 +1,4 @@
-import type { EditorTheme, MarkdownTheme, SelectListTheme } from "@earendil-works/pi-tui";
+import type { EditorTheme, MarkdownTheme, SelectListTheme, SettingsListTheme } from "@earendil-works/pi-tui";
 
 // 最小 ANSI 主题：不引入额外依赖
 const wrap =
@@ -26,6 +26,14 @@ export const selectListTheme: SelectListTheme = {
 export const editorTheme: EditorTheme = {
 	borderColor: colors.dim,
 	selectList: selectListTheme,
+};
+
+export const settingsListTheme: SettingsListTheme = {
+	label: (text, selected) => (selected ? colors.cyan(text) : text),
+	value: (text, selected) => (selected ? colors.cyan(text) : colors.dim(text)),
+	description: colors.dim,
+	cursor: colors.cyan("→ "),
+	hint: colors.dim,
 };
 
 export const markdownTheme: MarkdownTheme = {

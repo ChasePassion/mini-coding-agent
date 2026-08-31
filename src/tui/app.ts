@@ -1,5 +1,6 @@
 import type { Context, Message } from "@earendil-works/pi-ai";
 import {
+	CombinedAutocompleteProvider,
 	Container,
 	Editor,
 	Loader,
@@ -7,24 +8,32 @@ import {
 	ProcessTerminal,
 	ScrollView,
 	SelectList,
+	SettingsList,
 	Text,
 	TuiAltScreen,
 	VStack,
 	matchesKey,
 	type SelectItem,
+	type SettingItem,
+	type SlashCommand,
 } from "@earendil-works/pi-tui";
 import type { LLMClient } from "../ai/client.ts";
 import { runAgentLoop } from "../agent/loop.ts";
+import { MetricsCollector } from "../agent/metrics.ts";
 import { buildSystemPrompt } from "../agent/prompt.ts";
 import { ToolScheduler } from "../agent/scheduler.ts";
+import { createAskTool } from "../agent/tools/ask.ts";
 import type { ToolRegistry } from "../agent/tools/index.ts";
 import type { AgentEvent, RunMode, ToolCallInfo } from "../events.ts";
+import { createTuiAskUser } from "./ask.ts";
 import { TuiPermissionRequester } from "./permission.ts";
-import { colors, editorTheme, markdownTheme, selectListTheme } from "./theme.ts";
+import { colors, editorTheme, markdownTheme, selectListTheme, settingsListTheme } from "./theme.ts";
 
 const HELP_MARKDOWN = [
 	"**命令**",
 	"- `/mode` — 切换 Default / Full Access 模式",
+	"- `/ask-user` — 开关 ask_user 工具（OFF 时从模型可见工具中移除）",
+	"- `/ui` — 界面设置：展开思考过程 / 展开工具详情",
 	"- `/clear` — 清空当前会话",
 	"- `/help` — 显示本帮助",
 	"",
@@ -36,10 +45,7 @@ const HELP_MARKDOWN = [
 	"- Full Access：解除文件边界与审批",
 ].join("\n");
 
-interface ToolRow {
-	row: Text;
-	label: string;
-}
+const WELCOME = "输入任务开始。/help 查看帮助 · Esc 中断 · Ctrl+C 退出";
 
 function toolLabel(call: ToolCallInfo): string {
 	switch (call.toolName) {
@@ -49,26 +55,42 @@ function toolLabel(call: ToolCallInfo): string {
 			return `${call.toolName} ${String(call.args.path ?? "")}`.trim();
 		case "bash":
 			return `bash: ${String(call.args.command ?? "").slice(0, 60)}`;
+		case "ask_user":
+			return `ask_user: ${String(call.args.question ?? "").slice(0, 60)}`;
 		default:
 			return call.toolName;
 	}
 }
 
 function truncate(text: string, max: number): string {
-	return text.length <= max ? text : `${text.slice(0, max)}…`;
+	return text.length <= max ? `${text}` : `${text.slice(0, max)}…`;
 }
 
-/** 聊天 TUI（设计方案 §23/§24/§25/§27）：事件流的唯一渲染端，不持有业务状态。 */
+interface ToolState {
+	call: ToolCallInfo;
+	started: boolean;
+	done?: { ok: boolean; durationMs: number; output?: string; error?: string };
+}
+
+/**
+ * 聊天 TUI（设计方案 §23/§24/§26/§27）：事件流的唯一渲染端，不持有业务状态。
+ * 渲染 = 从事件日志全量重建 transcript（/ui 折叠切换、未来 WebUI snapshot 共用同一推导逻辑）。
+ */
 export class TuiApp {
 	readonly editor: Editor;
 	private readonly tui: TuiAltScreen;
 	private readonly transcript = new Container();
 	private readonly header = new Text("", 1, 0);
-	private readonly toolRows = new Map<string, ToolRow>();
 	private readonly scheduler: ToolScheduler;
 	private readonly signalHolder: { signal?: AbortSignal } = {};
+	private events: AgentEvent[] = [];
+	private metrics = new MetricsCollector();
 	private messages: Message[] = [];
 	private mode: RunMode = "default";
+	private askUserEnabled = true;
+	private expandThinking = false;
+	private expandTools = false;
+	private streaming = false;
 	private running = false;
 	private abortController: AbortController | null = null;
 	private dialogOpen = false;
@@ -86,6 +108,27 @@ export class TuiApp {
 		this.tui = new TuiAltScreen(new ProcessTerminal());
 		this.editor = new Editor(this.tui, editorTheme);
 		this.editor.onSubmit = (text) => this.handleSubmit(text);
+
+		const slashCommands: SlashCommand[] = [
+			{ name: "/mode", description: "切换 Default / Full Access 模式" },
+			{ name: "/ask-user", description: "开关 ask_user 工具" },
+			{ name: "/ui", description: "界面设置（思考/工具详情）" },
+			{ name: "/clear", description: "清空当前会话" },
+			{ name: "/help", description: "显示帮助" },
+		];
+		this.editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider(slashCommands, opts.workspace, null),
+		);
+
+		const ask = createTuiAskUser({
+			tui: this.tui,
+			emit: (e) => this.onEvent(e),
+			restoreFocus: () => this.tui.setFocus(this.editor),
+			onDialogOpenChange: (open) => {
+				this.dialogOpen = open;
+			},
+		});
+		opts.registry.register(createAskTool(ask));
 
 		// ctx.signal 走 getter 桥接 signalHolder：每轮任务的 AbortController 动态挂载，工具可感知中断
 		// （getter 内 this 指向 ctx 对象，故先捕获 holder 引用）
@@ -134,11 +177,12 @@ export class TuiApp {
 	}
 
 	start(): void {
-		this.refreshHeader();
-		this.transcript.addChild(
-			new Text(colors.dim("输入任务开始。/help 查看帮助 · Esc 中断 · Ctrl+C 退出"), 1, 0),
-		);
-		this.onEvent({ type: "session_started", sessionId: this.opts.sessionId, workspace: this.opts.workspace, mode: this.mode });
+		this.onEvent({
+			type: "session_started",
+			sessionId: this.opts.sessionId,
+			workspace: this.opts.workspace,
+			mode: this.mode,
+		});
 		this.tui.setFocus(this.editor);
 		this.tui.start();
 	}
@@ -146,8 +190,9 @@ export class TuiApp {
 	private refreshHeader(): void {
 		const modeLabel =
 			this.mode === "default" ? colors.green("Default 模式") : colors.yellow("Full Access 模式");
+		const askLabel = this.askUserEnabled ? colors.dim("提问 开") : colors.dim("提问 关");
 		this.header.setText(
-			`${colors.bold("mini-coding-agent")}${colors.dim(" · ")}${this.opts.workspace}${colors.dim(" · ")}${modeLabel}`,
+			`${colors.bold("mini-coding-agent")}${colors.dim(" · ")}${this.opts.workspace}${colors.dim(" · ")}${modeLabel}${colors.dim(" · ")}${askLabel}`,
 		);
 		this.tui.requestRender();
 	}
@@ -178,9 +223,16 @@ export class TuiApp {
 			case "/mode":
 				this.showModeDialog();
 				return;
+			case "/ask-user":
+				this.showAskUserDialog();
+				return;
+			case "/ui":
+				this.showUiDialog();
+				return;
 			case "/clear":
 				this.messages = [];
-				this.toolRows.clear();
+				this.events = [];
+				this.metrics = new MetricsCollector();
 				this.transcript.clear();
 				this.transcript.addChild(new Text(colors.dim("会话已清空"), 1, 0));
 				this.tui.requestRender();
@@ -191,7 +243,7 @@ export class TuiApp {
 				return;
 			default:
 				this.transcript.addChild(
-					new Text(colors.yellow(`未知命令 ${text}，可用：/mode /clear /help`), 1, 0),
+					new Text(colors.yellow(`未知命令 ${text}，可用：/mode /ask-user /ui /clear /help`), 1, 0),
 				);
 				this.tui.requestRender();
 		}
@@ -230,6 +282,74 @@ export class TuiApp {
 		list.onCancel = done;
 	}
 
+	private showAskUserDialog(): void {
+		const items: SelectItem[] = [
+			{ value: "on", label: "开启（模型可使用 ask_user 提问）" },
+			{ value: "off", label: "关闭（从模型可见工具中移除）" },
+		];
+		const list = new SelectList(items, items.length, selectListTheme);
+		list.setSelectedIndex(this.askUserEnabled ? 0 : 1);
+		const handle = this.tui.showOverlay(new VStack([new Text("ask_user 工具", 1, 0), list]));
+		this.dialogOpen = true;
+		this.tui.setFocus(list);
+		const done = () => {
+			this.dialogOpen = false;
+			handle.hide();
+			this.tui.setFocus(this.editor);
+			this.tui.requestRender();
+		};
+		list.onSelect = (item) => {
+			const next = item.value === "on";
+			done();
+			if (next !== this.askUserEnabled) {
+				this.askUserEnabled = next;
+				this.onEvent({ type: "ask_user_toggled", enabled: next });
+			}
+		};
+		list.onCancel = done;
+	}
+
+	private showUiDialog(): void {
+		const items: SettingItem[] = [
+			{
+				id: "thinking",
+				label: "展开思考过程",
+				description: "默认折叠为一行摘要（💭 thinking）",
+				currentValue: this.expandThinking ? "开" : "关",
+				values: ["开", "关"],
+			},
+			{
+				id: "tools",
+				label: "展开工具详情",
+				description: "默认只显示单行工具状态（✓/×），展开后附带输出",
+				currentValue: this.expandTools ? "开" : "关",
+				values: ["开", "关"],
+			},
+		];
+		let handle: { hide(): void } | undefined;
+		const closeDialog = () => {
+			this.dialogOpen = false;
+			handle?.hide();
+			this.tui.setFocus(this.editor);
+			this.tui.requestRender();
+		};
+		const list = new SettingsList(
+			items,
+			items.length,
+			settingsListTheme,
+			(id, newValue) => {
+				if (id === "thinking") this.expandThinking = newValue === "开";
+				if (id === "tools") this.expandTools = newValue === "开";
+				// 全量重绘：折叠是纯渲染行为，事件流不变（§6.10）
+				this.rebuildTranscript();
+			},
+			closeDialog,
+		);
+		handle = this.tui.showOverlay(new VStack([new Text("界面设置", 1, 0), list]));
+		this.dialogOpen = true;
+		this.tui.setFocus(list);
+	}
+
 	private async runTurn(text: string): Promise<void> {
 		this.running = true;
 		this.abortController = new AbortController();
@@ -246,7 +366,7 @@ export class TuiApp {
 		const context: Context = {
 			systemPrompt: buildSystemPrompt(this.opts.workspace, this.mode),
 			messages: this.messages,
-			tools: this.opts.registry.list(),
+			tools: this.opts.registry.list({ askUser: this.askUserEnabled }),
 		};
 		try {
 			await runAgentLoop(context, {
@@ -263,76 +383,118 @@ export class TuiApp {
 	}
 
 	private onEvent(e: AgentEvent): void {
-		switch (e.type) {
-			case "session_started":
-			case "mode_changed":
-				this.refreshHeader();
-				return;
-			case "user_message_added":
-				this.transcript.addChild(new Text(`${colors.bold("❯ ")}${e.content}`, 1, 0));
-				break;
-			case "assistant_started":
-				this.startLoader();
-				break;
-			case "assistant_delta":
-				break; // 流式渲染需完整 Markdown 文本，completed 时一次性展示
-			case "assistant_completed":
-				this.stopLoader();
-				if (e.text.trim()) this.transcript.addChild(new Markdown(e.text, 1, 0, markdownTheme));
-				break;
-			case "tool_queued": {
-				const label = toolLabel(e.call);
-				const row = new Text(colors.dim(`· ${label}`), 1, 0);
-				this.toolRows.set(e.call.callId, { row, label });
-				this.transcript.addChild(row);
-				break;
-			}
-			case "permission_required":
-				this.transcript.addChild(new Text(colors.yellow(`? 权限请求：${e.summary}`), 1, 0));
-				break;
-			case "tool_started": {
-				const entry = this.toolRows.get(e.callId);
-				if (entry) entry.row.setText(colors.cyan(`◌ ${entry.label}`));
-				break;
-			}
-			case "tool_completed": {
-				const entry = this.toolRows.get(e.callId);
-				const label = entry?.label ?? e.toolName;
-				if (entry) this.toolRows.delete(e.callId);
-				const line = e.ok
-					? colors.green(`✓ ${label} (${e.durationMs}ms)`)
-					: colors.red(`× ${label}`);
-				if (entry) entry.row.setText(line);
-				else this.transcript.addChild(new Text(line, 1, 0));
-				if (!e.ok && e.error) {
-					this.transcript.addChild(new Text(colors.dim(`  ${truncate(e.error.replace(/\n/g, " "), 200)}`), 1, 0));
-				}
-				break;
-			}
-			case "agent_error":
-				this.stopLoader();
-				this.transcript.addChild(new Text(colors.red(`✗ ${e.message}`), 1, 0));
-				break;
-			case "turn_completed":
-				this.stopLoader();
-				break;
-			default:
-				break;
-		}
-		this.tui.requestRender();
+		this.events.push(e);
+		this.metrics.onEvent(e);
+		if (e.type === "assistant_started") this.streaming = true;
+		if (e.type === "assistant_completed" || e.type === "turn_completed") this.streaming = false;
+		this.rebuildTranscript();
+		this.refreshHeader();
 	}
 
-	private startLoader(): void {
-		this.stopLoader();
-		this.loader = new Loader(this.tui, colors.cyan, colors.dim, "生成中…");
-		this.transcript.addChild(this.loader);
-	}
-
-	private stopLoader(): void {
+	/** 渲染 = fold(事件日志)：唯一构建 UI 状态的方式，与折叠开关、未来 WebUI snapshot 共用 */
+	private rebuildTranscript(): void {
 		if (this.loader) {
-			this.transcript.removeChild(this.loader);
 			this.loader.stop();
 			this.loader = null;
 		}
+		this.transcript.clear();
+
+		// 工具调用终态预计算（按事件顺序推导）
+		const tools = new Map<string, ToolState>();
+		for (const e of this.events) {
+			if (e.type === "tool_queued") tools.set(e.call.callId, { call: e.call, started: false });
+		}
+		for (const e of this.events) {
+			if (e.type === "tool_started") {
+				const t = tools.get(e.callId);
+				if (t) t.started = true;
+			} else if (e.type === "tool_completed") {
+				const t = tools.get(e.callId);
+				if (t) t.done = { ok: e.ok, durationMs: e.durationMs, output: e.output, error: e.error };
+			}
+		}
+
+		for (const e of this.events) {
+			switch (e.type) {
+				case "user_message_added":
+					this.transcript.addChild(new Text(`${colors.bold("❯ ")}${e.content}`, 1, 0));
+					break;
+				case "assistant_completed": {
+					if (e.thinking) {
+						this.transcript.addChild(
+							new Text(
+								colors.dim(
+									this.expandThinking
+										? truncate(e.thinking, 4000)
+										: `💭 thinking (${((e.thinkingMs ?? 0) / 1000).toFixed(1)}s)`,
+								),
+								1,
+								0,
+							),
+						);
+					}
+					if (e.text.trim()) this.transcript.addChild(new Markdown(e.text, 1, 0, markdownTheme));
+					break;
+				}
+				case "tool_queued": {
+					const state = tools.get(e.call.callId);
+					const label = toolLabel(e.call);
+					let line: string;
+					if (state?.done) {
+						line = state.done.ok
+							? colors.green(`✓ ${label} (${state.done.durationMs}ms)`)
+							: colors.red(`× ${label}`);
+					} else if (state?.started) {
+						line = colors.cyan(`◌ ${label}`);
+					} else {
+						line = colors.dim(`· 等待中 ${label}`);
+					}
+					this.transcript.addChild(new Text(line, 1, 0));
+					if (state?.done && !state.done.ok && state.done.error) {
+						this.transcript.addChild(
+							new Text(colors.dim(`  ${truncate(state.done.error.replace(/\n/g, " "), 200)}`), 1, 0),
+						);
+					} else if (state?.done?.ok && this.expandTools && state.done.output) {
+						this.transcript.addChild(
+							new Text(colors.dim(`  ${truncate(state.done.output, 1200)}`), 1, 0),
+						);
+					}
+					break;
+				}
+				case "permission_required":
+					this.transcript.addChild(new Text(colors.yellow(`? 权限请求：${e.summary}`), 1, 0));
+					break;
+				case "user_input_requested":
+					this.transcript.addChild(new Text(colors.cyan(`? Agent 提问：${e.question}`), 1, 0));
+					break;
+				case "user_input_received":
+					this.transcript.addChild(new Text(colors.dim(`↩ 用户回答：${e.answer}`), 1, 0));
+					break;
+				case "agent_error":
+					this.transcript.addChild(new Text(colors.red(`✗ ${e.message}`), 1, 0));
+					break;
+				case "turn_completed": {
+					const m = this.metrics;
+					const parts: string[] = [];
+					if (m.turns > 0) parts.push(`cache ${(m.cacheHitRate * 100).toFixed(0)}%`);
+					const total = m.tools.ok + m.tools.failed;
+					if (total > 0) parts.push(`tools ${m.tools.ok}/${total}`);
+					if (m.tools.denied > 0) parts.push(`deny ${m.tools.denied}`);
+					if (parts.length > 0) {
+						this.transcript.addChild(new Text(colors.dim(`— ${parts.join(" · ")} —`), 1, 0));
+					}
+					break;
+				}
+				default:
+					break;
+			}
+		}
+
+		if (this.events.length === 0) this.transcript.addChild(new Text(colors.dim(WELCOME), 1, 0));
+		if (this.streaming) {
+			this.loader = new Loader(this.tui, colors.cyan, colors.dim, "生成中…");
+			this.transcript.addChild(this.loader);
+		}
+		this.tui.requestRender();
 	}
 }

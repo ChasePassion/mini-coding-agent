@@ -25,6 +25,7 @@ function main(): void {
 		createListTool(env),
 		createBashTool(env),
 	]);
+	// ask_user 工具由 TuiApp 在构造时注册（其执行体依赖 TUI 对话框，晚绑定注入）
 
 	const app = new TuiApp({
 		client,

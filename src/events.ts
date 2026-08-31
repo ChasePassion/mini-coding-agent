@@ -28,7 +28,7 @@ export type AgentEvent =
 	| { type: "turn_started"; turnId: string }
 	| { type: "assistant_started"; messageId: string }
 	| { type: "assistant_delta"; messageId: string; delta: string }
-	| { type: "assistant_completed"; messageId: string; text: string; stopReason: string; usage?: TokenUsage }
+	| { type: "assistant_completed"; messageId: string; text: string; stopReason: string; usage?: TokenUsage; thinking?: string; thinkingMs?: number }
 	| { type: "turn_completed"; turnId: string; stopReason: string }
 	// ── 工具：调度态（queued）与执行态（started/completed）严格分离 ──
 	| { type: "tool_queued"; call: ToolCallInfo }

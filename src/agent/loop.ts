@@ -33,13 +33,19 @@ export async function runAgentLoop(context: Context, opts: AgentLoopOptions): Pr
 			const assistantId = `assistant-${Date.now().toString(36)}`;
 			emit({ type: "assistant_started", messageId: assistantId });
 			const stream = client.stream(context, { signal });
+			let thinkingText = "";
+			let thinkingStart = 0;
 			for await (const ev of stream) {
 				if (ev.type === "text_delta" && ev.delta) {
 					emit({ type: "assistant_delta", messageId: assistantId, delta: ev.delta });
+				} else if (ev.type === "thinking_delta" && ev.delta) {
+					if (!thinkingStart) thinkingStart = Date.now();
+					thinkingText += ev.delta; // 思考内容随 assistant_completed 一次性携带（§6.10 折叠展示）
 				}
 			}
 			const message = await stream.result();
 			context.messages.push(message);
+			const thinkingMs = thinkingStart ? Date.now() - thinkingStart : undefined;
 
 			// 2) 失败/中止：终止本轮（请求级失败不抛异常，由 stopReason 携带）
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -53,6 +59,8 @@ export async function runAgentLoop(context: Context, opts: AgentLoopOptions): Pr
 				text: textOf(message),
 				stopReason: message.stopReason,
 				usage: usageOf(message.usage),
+				thinking: thinkingText || undefined,
+				thinkingMs,
 			});
 
 			// 3) 退出条件：没有工具需要执行 → 最终答案，退出 loop
