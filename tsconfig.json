@@ -9,7 +9,6 @@
 		"noEmit": true,
 		"allowImportingTsExtensions": true,
 		"verbatimModuleSyntax": true,
-		"erasableSyntaxOnly": true,
 		"skipLibCheck": true,
 		"forceConsistentCasingInFileNames": true
 	},
