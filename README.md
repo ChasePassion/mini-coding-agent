@@ -9,11 +9,13 @@
 ```bash
 npm install
 cp .env.example .env   # 填入 MINIMAX_CN_API_KEY（sk-cp- 前缀的 coding plan Key）
-npm start              # 在目标项目目录启动 TUI，当前目录即 Workspace
+npm start              # 启动时选择 TUI / WebUI（或 npm start -- --interface web）
 ```
 
-- `Enter` 发送任务，`Esc` 中断当前任务，`Ctrl+C` 退出
-- Slash 命令：`/mode` 切换模式、`/clear` 清空会话、`/help` 帮助
+- TUI：`Enter` 发送任务，`Esc` 中断当前任务，`Ctrl+C` 退出
+- WebUI：自动打开 `http://localhost:4162`（左侧会话历史 + 右侧对话；权限/ask_user 以卡片交互；刷新后经 snapshot 恢复）
+- Slash 命令（TUI，带补全）：`/mode` 切换模式、`/ask-user` 开关 ask_user、`/ui` 展开思考/工具详情、`/clear`、`/help`
+- WebUI 前端构建：`cd webui && npm install && npm run build`（产物 `webui/dist`，服务端自动托管）
 
 ## 架构
 
@@ -86,20 +88,23 @@ Phase 2 专项验证：
 
 ## 界面
 
-- **TUI**（`npm start`）：头部（Workspace / 模式 / ask_user 开关）+ 对话流（工具行 `排队 → ◌ → ✓/×`，等待队列可见）+ 输入框
-- Slash 命令（带自动补全）：`/mode` 切换模式、`/ask-user` 开关 ask_user（OFF 时从模型可见 schema 中移除，而非返回拒绝）、`/ui` 展开思考过程/工具详情（全量重绘）、`/clear`、`/help`
-- 每轮结束打印指标摘要行：`— cache 62% · tools 5/6 · deny 1 —`（缓存命中率 = cacheRead / (input+cacheRead+cacheWrite)；deny 不计入失败分母）
-- `Esc` 中断当前任务（AbortSignal 贯穿到 bash 子进程），`Ctrl+C` 退出
+**TUI 与 WebUI 消费同一事件流、共享同一会话核心（`AgentSession`）**——前端形态只体现在注入的权限/提问实现上。
+
+- **TUI**：头部（Workspace / 模式 / ask_user 开关）+ 对话流（工具行 `排队 → ◌ → ✓/×`，等待队列可见）+ 输入框上方右侧常驻 cache 命中率
+- **WebUI**（AI Elements 组件）：左侧会话历史（新建/切换，持久化于 `~/.mini-agent/sessions/`，含 events.jsonl 与上下文快照）、右侧对话区；工具卡四态（Pending/Running/Completed/Error，可展开参数与输出）、思考过程折叠（Reasoning，带时长）、权限确认卡（Confirmation，三选项）、ask_user 卡（选项 + 自定义输入）、顶栏模式切换/ask_user 开关/指标 chip/中断按钮
+- Slash 命令（TUI 带自动补全）：`/mode`、`/ask-user`（OFF 时从模型可见 schema 中移除）、`/ui`（展开思考/工具详情，全量重绘）、`/clear`、`/help`
+- 每轮结束打印指标摘要：`— cache 62% · tools 5/6 · deny 1 —`（deny 不计入失败分母）
+- `Esc` / 中断按钮触发 AbortSignal（贯穿到 bash 子进程）；刷新 WebUI 后经 snapshot 恢复，pending 的权限/提问会重发，不会挂起 agent
 
 ## 录屏说明
 
 开发过程录屏文件后续存放于 `recordings/` 目录（不包含 Key 等敏感信息）。
 
-## Roadmap（Phase 3）
+## Roadmap
 
 - [x] ~~工具并行调用：两级锁（全局门 + 文件读写锁）+ Bash 预约执行权~~（Phase 2 完成）
 - [x] ~~`ask_user` 工具与开关~~（Phase 2 完成）
 - [x] ~~指标采集（缓存命中率 / 工具成功率）与 `/ui` 折叠开关、slash 补全、等待队列展示~~（Phase 2 完成）
-- [ ] WebUI（WebSocket 消费同一事件流，快照恢复，权限/ask_user 卡片）
+- [x] ~~WebUI（WebSocket 消费同一事件流，快照恢复，权限/ask_user 卡片，会话侧栏）~~（Phase 3 完成，[vercel/ai-elements](https://github.com/vercel/ai-elements) 组件）
 
-详细设计见技术方案 §8 阶段三。
+详细设计见技术方案 §8。
