@@ -9,9 +9,12 @@ function feed(collector: MetricsCollector, events: AgentEvent[]): void {
 }
 
 test("缓存命中率：按锚点公式（分母 = input+cacheRead+cacheWrite 三类之和）", () => {
-	// 注：技术方案 §9.1 示例断言 150/300，但其 §6.7 锚点公式对同样数字给出 400 分母（两类输入
-	// 计入方式不同）。锚点公式是唯一实现（getter 集中改动点），此处按公式断言 150/400；
-	// 真实 MiniMax usage 字段语义（input 是否已含 cache token）待线上核对后统一调整。
+	// 字段语义已实测验证（scripts/usage-probe.ts，MiniMax CN）：
+	// input 完全不含缓存 token（探测三轮 input=0，输入 token 只进 cacheRead/cacheWrite），
+	// 故三类之和恰好每个 token 计一次，公式成立。§9.1 示例 150/300 与锚点公式的 400 分母
+	// 属原文算术笔误，以锚点公式为准。
+	// 另：MiniMax 对紧接着的下一次请求可能整体重写缓存（cacheRead=0）而非命中，
+	// 属 provider 行为，不影响本公式。
 	const m = new MetricsCollector();
 	feed(m, [
 		{ type: "assistant_completed", messageId: "m1", text: "", stopReason: "stop", usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 100 } },
