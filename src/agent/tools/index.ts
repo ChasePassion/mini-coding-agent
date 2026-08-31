@@ -48,15 +48,20 @@ export class ToolRegistry {
 	constructor(tools: AgentTool[]) {
 		for (const t of tools) this.tools.set(t.name, t);
 	}
+	register(tool: AgentTool): void {
+		if (!this.tools.has(tool.name)) this.tools.set(tool.name, tool);
+	}
 	get(name: string): AgentTool | undefined {
 		return this.tools.get(name);
 	}
-	/** pi-ai Context.tools 形态 */
-	list(): Tool[] {
-		return [...this.tools.values()].map((t) => ({
-			name: t.name,
-			description: t.description,
-			parameters: t.parameters,
-		}));
+	/**
+	 * pi-ai Context.tools 形态。ask_user 开关（设计方案 §22）：OFF 时直接从 schema 中删除
+	 * 该工具（模型看不见就不会调用），而不是返回 Permission Denied。缺省视为 ON。
+	 */
+	list(opts?: { askUser?: boolean }): Tool[] {
+		const askOn = opts?.askUser ?? true;
+		return [...this.tools.values()]
+			.filter((t) => t.name !== "ask_user" || askOn)
+			.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
 	}
 }
